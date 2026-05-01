@@ -16,7 +16,7 @@ import rtoml
 
 from caliscope.persistence import PersistenceError
 from caliscope.core.aruco_target import ArucoTarget
-from caliscope.core.charuco import Charuco
+from caliscope.core.charuco import Charuco, derive_charuco_square_cm_and_margin_mm
 from caliscope.core.chessboard import Chessboard
 
 logger = logging.getLogger(__name__)
@@ -257,7 +257,7 @@ class CalibrationTargetsRepository:
 
         Defaults:
         - config.toml: charuco/charuco, same_as_intrinsic = true
-        - intrinsic_charuco.toml: Charuco(4, 5, 11, 8.5, square_size_override_cm=5.4)
+        - intrinsic_charuco.toml: default Letter-size board with auto square size from print margin
         - chessboard.toml: Chessboard(rows=6, columns=9)
         - aruco_target.toml: ArucoTarget.single_marker()
 
@@ -279,7 +279,8 @@ class CalibrationTargetsRepository:
         # Intrinsic charuco
         if not self.intrinsic_charuco_exists():
             logger.info("Creating default intrinsic charuco board")
-            default_charuco = Charuco(4, 5, 11, 8.5, square_size_override_cm=5.4)
+            _sq_cm, _ = derive_charuco_square_cm_and_margin_mm(8.5, 11.0, "inch", 4, 5)
+            default_charuco = Charuco(4, 5, 11, 8.5, square_size_override_cm=_sq_cm)
             self.save_intrinsic_charuco(default_charuco)
 
         # Chessboard
