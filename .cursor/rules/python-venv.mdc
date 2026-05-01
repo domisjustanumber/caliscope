@@ -1,0 +1,13 @@
+---
+description: Run Python tooling only via the project .venv (not system Python).
+alwaysApply: true
+---
+
+# Project virtual environment
+
+Use the interpreter and console scripts inside this repo’s `.venv` for every shell command (pytest, pip, pip install, hatch, ruff, etc.).
+
+- **Windows**: `.venv\Scripts\python.exe` and sibling scripts under `.venv\Scripts\` (e.g. `.venv\Scripts\pytest.exe`).
+- **macOS / Linux**: `.venv/bin/python` and `.venv/bin/pytest`, etc.
+
+Do not rely on a global `python` or `pytest` on `PATH` unless the virtual environment has been activated and you have confirmed it resolves to `.venv`.
