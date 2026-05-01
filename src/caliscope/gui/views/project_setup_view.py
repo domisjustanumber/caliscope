@@ -756,17 +756,7 @@ class ProjectSetupView(QWidget):
         """Query Coordinator and update status display."""
         status = self._coordinator.get_workflow_status()
 
-        n_live = status.host_camera_count
-        if n_live is None:
-            cam_line = "Live cameras: could not detect count on this system"
-        elif n_live == 0:
-            cam_line = "No live cameras detected"
-        elif n_live == 1:
-            cam_line = "1 live camera detected"
-        else:
-            cam_line = f"{n_live} live cameras detected"
-
-        nf = status.intrinsic_calibration_file_count
+        nf = status.intrinsic_mp4_count
         if nf == 0:
             cal_line = "No calibration files detected (add cam_N.mp4 files to calibration/intrinsic/)"
         elif nf == 1:
@@ -774,7 +764,7 @@ class ProjectSetupView(QWidget):
         else:
             cal_line = f"{nf} calibration files detected"
 
-        self._camera_count_label.setText(f"{cam_line}\n{cal_line}")
+        self._camera_count_label.setText(cal_line)
 
         self._update_intrinsic_row(status)
         self._update_extraction_row(status)
