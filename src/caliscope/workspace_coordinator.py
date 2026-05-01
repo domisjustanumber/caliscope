@@ -165,12 +165,9 @@ class WorkspaceCoordinator(QObject):
     def cameras_tab_enabled(self) -> bool:
         """Whether Cameras tab should be enabled.
 
-        True when at least one intrinsic calibration video exists under
-        ``calibration/intrinsic/``. Intrinsic calibration can run before
-        extrinsic videos are added; ``all_instrinsic_mp4s_available`` remains
-        the stricter check for a complete intrinsic set vs. extrinsic cameras.
+        Requires: intrinsic videos exist for all cameras in the extrinsic set.
         """
-        return bool(self.workspace_guide.get_cam_ids_in_dir(self.workspace_guide.intrinsic_dir))
+        return self.workspace_guide.all_instrinsic_mp4s_available()
 
     @property
     def multi_camera_tab_enabled(self) -> bool:
@@ -312,7 +309,6 @@ class WorkspaceCoordinator(QObject):
         return WorkflowStatus(
             camera_count=camera_count,
             charuco_configured=True,
-            intrinsic_mp4_count=len(intrinsic_cam_ids),
             intrinsic_videos_available=len(intrinsic_missing) == 0,
             intrinsic_videos_missing=intrinsic_missing,
             intrinsic_calibration_complete=self.camera_array.all_intrinsics_calibrated(),

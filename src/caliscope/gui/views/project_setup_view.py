@@ -756,15 +756,11 @@ class ProjectSetupView(QWidget):
         """Query Coordinator and update status display."""
         status = self._coordinator.get_workflow_status()
 
-        nf = status.intrinsic_mp4_count
-        if nf == 0:
-            cal_line = "No calibration files detected (add cam_N.mp4 files to calibration/intrinsic/)"
-        elif nf == 1:
-            cal_line = "1 calibration file detected"
+        # Update camera count display
+        if status.camera_count > 0:
+            self._camera_count_label.setText(f"Detected cameras: {status.camera_count} (from extrinsic videos)")
         else:
-            cal_line = f"{nf} calibration files detected"
-
-        self._camera_count_label.setText(cal_line)
+            self._camera_count_label.setText("No cameras detected (add cam_N.mp4 files to calibration/extrinsic/)")
 
         self._update_intrinsic_row(status)
         self._update_extraction_row(status)
