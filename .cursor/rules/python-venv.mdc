@@ -1,13 +1,24 @@
 ---
-description: Run Python tooling only via the project .venv (not system Python).
+description: Run Python tooling only via the project .venv and uv (not system Python or bare pip).
 alwaysApply: true
 ---
 
-# Project virtual environment
+# Project virtual environment and package installs
 
-Use the interpreter and console scripts inside this repo’s `.venv` for every shell command (pytest, pip, pip install, hatch, ruff, etc.).
+Use the interpreter and console scripts inside this repo’s `.venv` for every shell command (pytest, ruff, hatch, etc.).
 
-- **Windows**: `.venv\Scripts\python.exe` and sibling scripts under `.venv\Scripts\` (e.g. `.venv\Scripts\pytest.exe`).
+**Package installs and environment updates must go through [uv](https://docs.astral.sh/uv/), not bare `pip`.**
+
+- Sync from the lockfile (contributors): `uv sync --group dev --extra gui` (adjust groups/extras as needed).
+- Ad-hoc packages into the active project venv: `uv pip install <package>` (from repo root so uv targets `.venv`), or add deps to `pyproject.toml` / lockfile and re-run `uv sync`.
+- One-off commands without activating the shell: `uv run pytest`, `uv run python …`, etc.
+- **Do not** run `pip install`, `python -m pip install`, or `.venv\Scripts\pip.exe` / `.venv/bin/pip` for this project unless you are intentionally debugging pip itself.
+
+Paths:
+
+- **Windows**: `.venv\Scripts\python.exe` and siblings under `.venv\Scripts\` (e.g. `.venv\Scripts\pytest.exe`).
 - **macOS / Linux**: `.venv/bin/python` and `.venv/bin/pytest`, etc.
 
 Do not rely on a global `python` or `pytest` on `PATH` unless the virtual environment has been activated and you have confirmed it resolves to `.venv`.
+
+The workspace [.vscode/settings.json](.vscode/settings.json) sets `"python.packageManager": "uv"` so VS Code / Cursor use uv for editor-driven installs.

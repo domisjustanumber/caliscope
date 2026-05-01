@@ -1,7 +1,9 @@
 {
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
   "python.venvPath": "${workspaceFolder}",
   "python.terminal.activateEnvironment": true,
   "python.terminal.activateEnvInCurrentTerminal": true,
-  "python.globalModuleInstallation": false
+  "python.globalModuleInstallation": false,
+  "python.packageManager": "uv"
 }
