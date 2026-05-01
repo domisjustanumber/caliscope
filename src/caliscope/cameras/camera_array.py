@@ -30,6 +30,8 @@ class CameraData:
 
     cam_id: int
     size: tuple[int, int]
+    # OpenCV VideoCapture index for live intrinsic calibration (no cam_{id}.mp4).
+    live_device_index: int | None = None
     rotation_count: int = 0
     error: float | None = None  # the RMSE of reprojection associated with the intrinsic calibration
     matrix: np.ndarray | None = None
@@ -429,9 +431,13 @@ class CameraArray:
                 else:
                     rotation = None
 
+                raw_live = camera_data.get("live_device_index")
+                live_idx: int | None = None if raw_live is None or raw_live == "null" else int(raw_live)
+
                 camera = CameraData(
                     cam_id=cam_id,
                     size=(camera_data["size"][0], camera_data["size"][1]),
+                    live_device_index=live_idx,
                     rotation_count=camera_data.get("rotation_count", 0),
                     error=_clean_scalar(camera_data.get("error")),
                     matrix=matrix,
@@ -475,6 +481,7 @@ class CameraArray:
                 camera_dict = {
                     "cam_id": camera.cam_id,
                     "size": camera.size,
+                    "live_device_index": camera.live_device_index,
                     "rotation_count": camera.rotation_count,
                     "error": camera.error,
                     "matrix": _array_to_list(camera.matrix),
