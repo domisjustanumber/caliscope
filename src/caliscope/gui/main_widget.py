@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import rtoml
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -117,19 +117,10 @@ class MainWindow(QMainWindow):
         self.project_tab.tab_navigation_requested.connect(self._navigate_to_tab)
         self.central_tab.addTab(self.project_tab, "Project")
 
-        # Cameras tab - enabled based on computed property
-        cameras_enabled = self.coordinator.cameras_tab_enabled
-        if cameras_enabled:
-            logger.info("Building Cameras tab with intrinsic calibration")
-            self.cameras_tab_widget = CamerasTabWidget(self.coordinator)
-        else:
-            logger.info("Cameras tab disabled - no intrinsic videos available")
-            self.cameras_tab_widget = QWidget()
+        # Cameras tab - always available (intrinsic video may be partial or live-only)
+        logger.info("Building Cameras tab with intrinsic calibration")
+        self.cameras_tab_widget = CamerasTabWidget(self.coordinator)
         self.central_tab.addTab(self.cameras_tab_widget, "Cameras")
-        self.central_tab.setTabEnabled(
-            self.find_tab_index_by_title("Cameras"),
-            cameras_enabled,
-        )
 
         # Multi-Camera tab - enabled based on computed property
         multi_camera_enabled = self.coordinator.multi_camera_tab_enabled
@@ -185,6 +176,14 @@ class MainWindow(QMainWindow):
         self._previous_tab_index: int = 0
         self.central_tab.currentChanged.connect(self._on_tab_changed)
 
+        # load_workspace emits status_changed before tabs exist — refresh observers after attach.
+        QTimer.singleShot(0, self._emit_coordinator_startup_refresh)
+
+    def _emit_coordinator_startup_refresh(self) -> None:
+        """Notify listeners now that Coordinator ↔ tab wiring is installed."""
+        if hasattr(self, "coordinator") and self.coordinator is not None:
+            self.coordinator.status_changed.emit()
+
     def _refresh_tab_enablement(self) -> None:
         """Refresh tab enabled states from computed properties.
 
@@ -192,10 +191,6 @@ class MainWindow(QMainWindow):
         calibration complete, etc.).
         """
         # Update enabled state for each tab
-        self.central_tab.setTabEnabled(
-            self.find_tab_index_by_title("Cameras"),
-            self.coordinator.cameras_tab_enabled,
-        )
         self.central_tab.setTabEnabled(
             self.find_tab_index_by_title("Multi-Camera"),
             self.coordinator.multi_camera_tab_enabled,
@@ -214,18 +209,6 @@ class MainWindow(QMainWindow):
 
     def _maybe_replace_dummy_tabs(self) -> None:
         """Replace dummy widgets with real tabs when they become enabled."""
-        # Cameras tab
-        cameras_idx = self.find_tab_index_by_title("Cameras")
-        if self.coordinator.cameras_tab_enabled and not isinstance(
-            self.central_tab.widget(cameras_idx), CamerasTabWidget
-        ):
-            old = self.central_tab.widget(cameras_idx)
-            self.cameras_tab_widget = CamerasTabWidget(self.coordinator)
-            self.central_tab.removeTab(cameras_idx)
-            self.central_tab.insertTab(cameras_idx, self.cameras_tab_widget, "Cameras")
-            if old:
-                old.deleteLater()
-
         # Multi-Camera tab
         multi_idx = self.find_tab_index_by_title("Multi-Camera")
         if self.coordinator.multi_camera_tab_enabled and not isinstance(

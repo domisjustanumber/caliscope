@@ -12,8 +12,10 @@ import logging
 from enum import Enum, auto
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from typing import Any
 
+import cv2
 from PySide6.QtCore import QObject, Qt, Signal
 
 from caliscope.cameras.camera_array import CameraData
@@ -25,7 +27,8 @@ from caliscope.core.calibrate_intrinsics import (
 from caliscope.core.frame_selector import IntrinsicCoverageReport, select_calibration_frames
 from caliscope.core.point_data import ImagePoints
 from caliscope.packets import FramePacket, PointPacket
-from caliscope.recording.frame_packet_streamer import create_streamer
+from caliscope.recording.capture_devices import enumerate_supported_capture_resolutions
+from caliscope.recording.frame_packet_streamer import FramePacketStreamer, create_streamer
 from caliscope.recording.frame_source import FrameSource
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.task_manager.task_handle import TaskHandle
@@ -79,11 +82,12 @@ class IntrinsicCalibrationPresenter(QObject):
     calibration_complete = Signal(object)  # IntrinsicCalibrationOutput
     calibration_failed = Signal(str)
     frame_position_changed = Signal(int)  # Current frame index
+    live_resolution_changed = Signal(int, int)  # width, height (actual capture size)
 
     def __init__(
         self,
         camera: CameraData,
-        video_path: Path,
+        video_path: Path | None,
         tracker: Tracker,
         task_manager: TaskManager,
         parent: QObject | None = None,
@@ -94,8 +98,8 @@ class IntrinsicCalibrationPresenter(QObject):
         """Initialize the presenter.
 
         Args:
-            camera: CameraData with cam_id, size, rotation_count
-            video_path: Path to the video file for this camera
+            camera: CameraData with cam_id, size, rotation_count (and optionally live_device_index).
+            video_path: Path to intrinsic video, or None when :pyattr:`CameraData.live_device_index` is set.
             tracker: Tracker for calibration board point detection
             task_manager: TaskManager for background calibration
             parent: Optional Qt parent
@@ -110,6 +114,10 @@ class IntrinsicCalibrationPresenter(QObject):
         self._tracker = tracker
         self._task_manager = task_manager
         self._frame_skip = frame_skip
+
+        self._is_live = camera.live_device_index is not None
+        self._tracker_lock = Lock()
+        self._live_sample_counter = 0
 
         # Derived properties for convenience
         self._cam_id = camera.cam_id
@@ -137,36 +145,60 @@ class IntrinsicCalibrationPresenter(QObject):
         self._stop_collection = Event()
         self._collection_thread: Thread | None = None
 
-        # Single streamer for scrubbing (READY/CALIBRATED states)
-        self._streamer = create_streamer(
-            video_directory=self._video_path.parent,
-            cam_id=self._camera.cam_id,
-            rotation_count=self._camera.rotation_count,
-            tracker=self._tracker,
-            end_behavior="pause",  # Pause at end for interactive scrubbing
-        )
+        self._streamer: FramePacketStreamer | None = None
         self._frame_queue: Queue[FramePacket] = Queue()
-        self._streamer.subscribe(self._frame_queue)
-
-        # Start streamer worker (will read first frame, then we pause)
-        self._stream_handle = self._task_manager.submit(
-            self._streamer.play_worker,
-            name=f"Streamer cam_id {self._cam_id}",
-            auto_start=False,
-        )
-        self._task_manager.start_task(self._stream_handle.task_id)
-        self._streamer.pause()  # Immediately pause for scrubbing mode
-
-        # Position tracking (must be set before _load_initial_frame)
-        self._current_frame_index: int = self._streamer.start_frame_index
-
-        # Guaranteed initial frame display (don't rely on thread timing)
-        self._load_initial_frame()
-
-        # Consumer thread for streamer frames (scrubbing display only)
+        self._stream_handle: TaskHandle | None = None
         self._stop_event = Event()
-        self._consumer_thread = Thread(target=self._consume_frames, daemon=True)
-        self._consumer_thread.start()
+        self._consumer_thread: Thread | None = None
+        self._live_stop = Event()
+        self._live_thread: Thread | None = None
+        self._live_device_index: int | None = camera.live_device_index
+        self._live_resolution_lock = Lock()
+        self._pending_live_resolution: tuple[int, int] | None = None
+        self._live_supported_resolutions: list[tuple[int, int]] = []
+
+        if self._is_live:
+            if self._live_device_index is None:
+                raise ValueError("live_device_index required for live intrinsic calibration")
+            self._live_supported_resolutions = enumerate_supported_capture_resolutions(
+                self._live_device_index,
+                extra_sizes=(self._camera.size,),
+            )
+            if not self._live_supported_resolutions:
+                self._live_supported_resolutions = [self._camera.size]
+            self._current_frame_index = 0
+            self._live_stop.clear()
+            self._live_thread = Thread(target=self._live_capture_loop, daemon=True)
+        else:
+            if self._video_path is None:
+                raise ValueError("video_path is required for file-based intrinsic calibration")
+            self._streamer = create_streamer(
+                video_directory=self._video_path.parent,
+                cam_id=self._camera.cam_id,
+                rotation_count=self._camera.rotation_count,
+                tracker=self._tracker,
+                end_behavior="pause",  # Pause at end for interactive scrubbing
+            )
+            self._streamer.subscribe(self._frame_queue)
+
+            # Start streamer worker (will read first frame, then we pause)
+            self._stream_handle = self._task_manager.submit(
+                self._streamer.play_worker,
+                name=f"Streamer cam_id {self._cam_id}",
+                auto_start=False,
+            )
+            self._task_manager.start_task(self._stream_handle.task_id)
+            self._streamer.pause()  # Immediately pause for scrubbing mode
+
+            # Position tracking (must be set before _load_initial_frame)
+            self._current_frame_index = int(self._streamer.start_frame_index)
+
+            # Guaranteed initial frame display (don't rely on thread timing)
+            self._load_initial_frame()
+
+            # Consumer thread for streamer frames (scrubbing display only)
+            self._consumer_thread = Thread(target=self._consume_frames, daemon=True)
+            self._consumer_thread.start()
 
     @property
     def state(self) -> IntrinsicCalibrationState:
@@ -181,6 +213,30 @@ class IntrinsicCalibrationPresenter(QObject):
             return IntrinsicCalibrationState.COLLECTING
 
         return IntrinsicCalibrationState.READY
+
+    @property
+    def is_live_stream(self) -> bool:
+        """True when frames come from a capture device instead of a file."""
+        return self._is_live
+
+    @property
+    def live_supported_resolutions(self) -> list[tuple[int, int]]:
+        """Distinct resolutions accepted by the capture device (live cameras only)."""
+        return list(self._live_supported_resolutions)
+
+    def bind_workspace_camera(self, camera: CameraData) -> None:
+        """Keep presenter aligned with the workspace camera row after persistence."""
+        self._camera = camera
+        self._image_size = camera.size
+
+    def start_live_capture_if_needed(self) -> None:
+        """Start the live capture thread once signals are connected (Idempotent)."""
+        if not self._is_live or self._live_thread is None:
+            return
+        if self._live_thread.is_alive():
+            return
+        self._live_stop.clear()
+        self._live_thread.start()
 
     @property
     def display_queue(self) -> Queue[FramePacket | None]:
@@ -207,7 +263,10 @@ class IntrinsicCalibrationPresenter(QObject):
 
     @property
     def frame_count(self) -> int:
-        """Total frames in video."""
+        """Total frames in video, or running count for live capture."""
+        if self._is_live:
+            return max(1, self._current_frame_index + 1)
+        assert self._streamer is not None
         return self._streamer.last_frame_index + 1
 
     @property
@@ -244,13 +303,18 @@ class IntrinsicCalibrationPresenter(QObject):
         Call this when display settings change (e.g., undistort toggle)
         and the View needs to re-render with new settings.
         """
+        if self._is_live:
+            return
         self._load_initial_frame()
 
     def seek_to(self, frame_index: int) -> None:
         """Seek to frame. Works in READY/CALIBRATED states via streamer's seek_to."""
+        if self._is_live:
+            return
         if self.state not in (IntrinsicCalibrationState.READY, IntrinsicCalibrationState.CALIBRATED):
             return
 
+        assert self._streamer is not None
         frame_index = max(0, min(frame_index, self.frame_count - 1))
         self._streamer.seek_to(
             frame_index, precise=True
@@ -261,6 +325,7 @@ class IntrinsicCalibrationPresenter(QObject):
 
         Uses current_frame_index to preserve user's position (not always start_frame_index).
         """
+        assert self._streamer is not None
         # Use current position (default to start if not yet set)
         target_index = self._current_frame_index if self._current_frame_index > 0 else self._streamer.start_frame_index
 
@@ -269,7 +334,7 @@ class IntrinsicCalibrationPresenter(QObject):
         if packet is not None:
             self._display_queue.put(packet)
         else:
-            logger.warning(f"Failed to load frame {target_index} from {self._video_path}")
+            logger.warning(f"Failed to load frame {target_index} from {self._video_path!s}")
 
     # -------------------------------------------------------------------------
     # Collection: batch-seek pattern
@@ -294,7 +359,15 @@ class IntrinsicCalibrationPresenter(QObject):
         self._output = None
         self._calibration_task = None
 
+        if self._is_live:
+            self._live_sample_counter = 0
+            self._is_collecting = True
+            self._stop_collection.clear()
+            self._emit_state_changed()
+            return
+
         # Pause streamer — collection uses its own FrameSource
+        assert self._streamer is not None
         self._streamer.pause()
 
         # Now set collecting and emit state change
@@ -317,6 +390,15 @@ class IntrinsicCalibrationPresenter(QObject):
 
         logger.info(f"Stopping calibration collection for cam_id {self._cam_id}")
 
+        if self._is_live:
+            self._is_collecting = False
+            if len(self._collected_points) > 0:
+                self._on_collection_complete()
+            else:
+                self._collected_points.clear()
+                self._emit_state_changed()
+            return
+
         self._stop_collection.set()
         if self._collection_thread is not None:
             self._collection_thread.join(timeout=5.0)
@@ -333,6 +415,8 @@ class IntrinsicCalibrationPresenter(QObject):
         indices, tracks each frame, accumulates points, and emits for display.
         Matches the pattern in process_synchronized_recording().
         """
+        assert self._video_path is not None
+        assert self._streamer is not None
         frame_source = FrameSource(self._video_path.parent, self._cam_id)
         last_index = self._streamer.last_frame_index
         frame_skip = max(1, self._frame_skip)
@@ -353,7 +437,9 @@ class IntrinsicCalibrationPresenter(QObject):
                     continue
 
                 # Track the frame
-                points = self._tracker.get_points(frame, self._cam_id, self._camera.rotation_count)
+                with self._tracker_lock:
+                    tracker = self._tracker
+                points = tracker.get_points(frame, self._cam_id, self._camera.rotation_count) if tracker else None
 
                 # Accumulate if board detected
                 if points is not None and len(points.point_id) > 0:
@@ -519,8 +605,8 @@ class IntrinsicCalibrationPresenter(QObject):
         self.calibration_complete.emit(output)
         self._emit_state_changed()
 
-        # Seek to first frame so View can display with undistortion
-        self._streamer.seek_to(0, precise=True)
+        if self._streamer is not None:
+            self._streamer.seek_to(0, precise=True)
 
     def _on_calibration_failed(self, exc_type: str, message: str) -> None:
         """Handle calibration failure."""
@@ -544,8 +630,10 @@ class IntrinsicCalibrationPresenter(QObject):
         Args:
             tracker: New tracker to use for subsequent calibrations.
         """
-        self._tracker = tracker
-        self._streamer.update_tracker(tracker)
+        with self._tracker_lock:
+            self._tracker = tracker
+        if self._streamer is not None:
+            self._streamer.update_tracker(tracker)
         self._collected_points.clear()
         self._selection_result = None
         self._output = None
@@ -566,12 +654,208 @@ class IntrinsicCalibrationPresenter(QObject):
         """
         self._frame_skip = max(1, skip)
 
+    def request_live_resolution(self, width: int, height: int) -> None:
+        """Request a new capture resolution (live cameras only). Applied on the capture thread."""
+        if not self._is_live:
+            return
+        with self._live_resolution_lock:
+            self._pending_live_resolution = (int(width), int(height))
+
+    def _clear_calibration_scratchpad(self) -> None:
+        self._collected_points.clear()
+        self._selection_result = None
+        self._output = None
+        self._calibration_task = None
+
+    def _invalidate_live_session_after_resolution_change(self) -> None:
+        self._is_collecting = False
+        self._live_sample_counter = 0
+        self._clear_calibration_scratchpad()
+        self._emit_state_changed()
+
+    def _safe_cap_read(self, cap: cv2.VideoCapture) -> tuple[bool, Any]:
+        """Read one BGR frame; never raises cv2.error (MSMF can throw on bad buffers)."""
+        try:
+            ok, frame = cap.read()
+        except cv2.error:
+            logger.warning(
+                "VideoCapture.read raised cv2.error for cam_id %s",
+                self._cam_id,
+                exc_info=True,
+            )
+            return False, None
+        if not ok or frame is None:
+            return False, None
+        if frame.ndim != 3 or frame.shape[0] < 1 or frame.shape[1] < 1:
+            return False, None
+        return True, frame
+
+    def _try_apply_resolution_on_capture(
+        self,
+        cap: cv2.VideoCapture,
+        width: int,
+        height: int,
+        *,
+        max_reads: int = 4,
+    ) -> tuple[int, int] | None:
+        """Set frame size on an open capture and return actual (w, h) from a valid frame."""
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        for _ in range(max(1, max_reads)):
+            ok, frame = self._safe_cap_read(cap)
+            if not ok:
+                continue
+            return (int(frame.shape[1]), int(frame.shape[0]))
+        return None
+
+    def _apply_capture_resolution(
+        self,
+        device: int,
+        cap: cv2.VideoCapture,
+        width: int,
+        height: int,
+    ) -> tuple[cv2.VideoCapture, tuple[int, int]]:
+        """Request resolution; may reopen the device if the backend returns corrupt frames.
+
+        Returns:
+            ``(cap, (actual_w, actual_h))``. On total failure, returns the last opened
+            ``cap`` (may be closed) and restores :attr:`_camera.size` to ``prev_size``.
+        """
+        prev_size = self._camera.size
+
+        got = self._try_apply_resolution_on_capture(cap, width, height)
+        if got is None:
+            logger.warning(
+                "Reopening capture device %s for cam_id %s after failed resolution %sx%s",
+                device,
+                self._cam_id,
+                width,
+                height,
+            )
+            cap.release()
+            cap = cv2.VideoCapture(device)
+            if not cap.isOpened():
+                logger.error("Could not reopen capture device %s for cam_id %s", device, self._cam_id)
+                self._camera.size = prev_size
+                self._image_size = prev_size
+                return cap, prev_size
+            got = self._try_apply_resolution_on_capture(cap, width, height)
+
+        if got is None:
+            logger.error(
+                "Failed to set resolution %sx%s on device %s for cam_id %s; restoring %sx%s",
+                width,
+                height,
+                device,
+                self._cam_id,
+                prev_size[0],
+                prev_size[1],
+            )
+            restored = self._try_apply_resolution_on_capture(cap, prev_size[0], prev_size[1])
+            final = restored if restored is not None else prev_size
+            self._camera.size = final
+            self._image_size = final
+            return cap, final
+
+        self._camera.size = got
+        self._image_size = got
+        return cap, got
+
+    def _live_capture_loop(self) -> None:
+        """Continuous read from VideoCapture; optional point collection when calibrating."""
+        device = self._live_device_index
+        if device is None:
+            return
+        cap = cv2.VideoCapture(device)
+        if not cap.isOpened():
+            logger.error("Could not open live capture device %s for cam_id %s", device, self._cam_id)
+            return
+
+        try:
+            initial_size = self._camera.size
+            cap, actual = self._apply_capture_resolution(device, cap, initial_size[0], initial_size[1])
+            if not cap.isOpened():
+                return
+
+            if actual != initial_size:
+                logger.info(
+                    "Live capture cam_id %s adjusted resolution %s -> %s",
+                    self._cam_id,
+                    initial_size,
+                    actual,
+                )
+                self._invalidate_live_session_after_resolution_change()
+                self.live_resolution_changed.emit(actual[0], actual[1])
+
+            frame_idx = 0
+            while not self._live_stop.is_set():
+                with self._live_resolution_lock:
+                    pending = self._pending_live_resolution
+                    self._pending_live_resolution = None
+                if pending is not None:
+                    prev = self._camera.size
+                    cap, new_actual = self._apply_capture_resolution(device, cap, pending[0], pending[1])
+                    if not cap.isOpened():
+                        return
+                    if new_actual != prev:
+                        logger.info(
+                            "Live capture cam_id %s resolution %s -> %s",
+                            self._cam_id,
+                            prev,
+                            new_actual,
+                        )
+                        self._invalidate_live_session_after_resolution_change()
+                    if new_actual != prev:
+                        self.live_resolution_changed.emit(new_actual[0], new_actual[1])
+
+                ok, frame = self._safe_cap_read(cap)
+                if not ok:
+                    continue
+
+                with self._tracker_lock:
+                    tracker = self._tracker
+
+                points_for_display = None
+                draw_instructions = None
+                if tracker is not None:
+                    points_for_display = tracker.get_points(frame, self._cam_id, self._camera.rotation_count)
+                    draw_instructions = tracker.scatter_draw_instructions
+
+                if self._is_collecting:
+                    self._live_sample_counter += 1
+                    if self._live_sample_counter >= max(1, self._frame_skip):
+                        self._live_sample_counter = 0
+                        if points_for_display is not None and len(points_for_display.point_id) > 0:
+                            self._collected_points.append((frame_idx, points_for_display))
+
+                packet = FramePacket(
+                    cam_id=self._cam_id,
+                    frame_index=frame_idx,
+                    frame_time=0.0,
+                    frame=frame,
+                    points=points_for_display,
+                    draw_instructions=draw_instructions,
+                )
+                self._display_queue.put(packet)
+                self._current_frame_index = frame_idx
+                self.frame_position_changed.emit(frame_idx)
+                frame_idx += 1
+        finally:
+            cap.release()
+            logger.info("Live capture ended for cam_id %s", self._cam_id)
+
     def cleanup(self) -> None:
         """Clean up resources. Call before discarding presenter."""
         # Stop collection if running
         self._stop_collection.set()
         if self._collection_thread is not None:
             self._collection_thread.join(timeout=2.0)
+
+        if self._is_live:
+            self._live_stop.set()
+            if self._live_thread is not None:
+                self._live_thread.join(timeout=2.0)
+            return
 
         # Stop consumer thread
         self._stop_event.set()
@@ -583,5 +867,6 @@ class IntrinsicCalibrationPresenter(QObject):
             self._stream_handle.cancel()
 
         # Clean up streamer
-        self._streamer.unsubscribe(self._frame_queue)
-        self._streamer.close()
+        if self._streamer is not None:
+            self._streamer.unsubscribe(self._frame_queue)
+            self._streamer.close()

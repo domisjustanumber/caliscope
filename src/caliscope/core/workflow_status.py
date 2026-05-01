@@ -34,8 +34,10 @@ class WorkflowStatus:
     """
 
     # Step 1: Project Setup
-    camera_count: int
+    camera_count: int  # Project camera set: cam_*.mp4 in calibration/extrinsic/
+    host_camera_count: int | None  # Live cameras (OS-reported; no VideoCapture)
     charuco_configured: bool  # Always True after init
+    intrinsic_calibration_file_count: int  # cam_*.mp4 files in calibration/intrinsic/
 
     # Step 2: Intrinsic Calibration
     intrinsic_videos_available: bool

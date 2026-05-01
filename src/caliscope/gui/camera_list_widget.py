@@ -11,11 +11,13 @@ import logging
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem
 
 from caliscope.cameras.camera_array import CameraArray
 
 logger = logging.getLogger(__name__)
+
+CAPTURE_DEVICE_MIME = "application/x-caliscope-capture-index"
 
 
 class CameraListWidget(QListWidget):
@@ -55,16 +57,18 @@ class CameraListWidget(QListWidget):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, cam_id)
 
+            live_suffix = " (live)" if camera.live_device_index is not None else ""
+
             if camera.matrix is not None and camera.distortions is not None:
                 # Calibrated: filled circle + green text + optional RMSE
                 if camera.error is not None:
-                    text = f"\u25cf Cam {cam_id} \u2014 {camera.error:.2f}px"
+                    text = f"\u25cf Cam {cam_id}{live_suffix} \u2014 {camera.error:.2f}px"
                 else:
-                    text = f"\u25cf Cam {cam_id}"
+                    text = f"\u25cf Cam {cam_id}{live_suffix}"
                 item.setForeground(QBrush(QColor("#4CAF50")))  # Material green
             else:
                 # Not calibrated: hollow circle + red text
-                text = f"\u25cb Cam {cam_id}"
+                text = f"\u25cb Cam {cam_id}{live_suffix}"
                 item.setForeground(QBrush(QColor("#F44336")))  # Material red
 
             item.setText(text)
@@ -107,3 +111,40 @@ class CameraListWidget(QListWidget):
         """Programmatically select a camera by cam_id."""
         if cam_id in self._cam_id_to_row:
             self.setCurrentRow(self._cam_id_to_row[cam_id])
+
+
+class ActiveCamerasListWidget(CameraListWidget):
+    """Active camera list that accepts drops of detected capture device indices."""
+
+    live_device_drop_requested = Signal(int)
+
+    def __init__(self, camera_array: CameraArray) -> None:
+        super().__init__(camera_array)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(CAPTURE_DEVICE_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat(CAPTURE_DEVICE_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if not event.mimeData().hasFormat(CAPTURE_DEVICE_MIME):
+            event.ignore()
+            return
+        raw = event.mimeData().data(CAPTURE_DEVICE_MIME)
+        try:
+            device_index = int(bytes(raw).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        self.live_device_drop_requested.emit(device_index)
+        event.acceptProposedAction()

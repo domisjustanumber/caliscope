@@ -31,6 +31,7 @@ from caliscope.persistence import PersistenceError
 from caliscope.repositories.intrinsic_report_repository import IntrinsicReportRepository
 from caliscope.reconstruction.reconstructor import Reconstructor
 from caliscope.recording import read_video_properties
+from caliscope.recording.capture_devices import count_attached_capture_devices_without_opening
 from caliscope.core.point_data import ImagePoints
 from caliscope.trackers.charuco_tracker import CharucoTracker
 from caliscope.trackers.chessboard_tracker import ChessboardTracker
@@ -227,12 +228,10 @@ class WorkspaceCoordinator(QObject):
         """
 
         def worker(_token, _handle):
-            # Load camera array if intrinsic videos exist
-            if self.cameras_tab_enabled:
-                logger.info("Loading camera array (intrinsic videos available)")
-                self.load_camera_array()
-            else:
-                logger.info("Skipping camera array load (no intrinsic videos)")
+            # Always load camera array so the Cameras tab can show project cameras,
+            # partial intrinsic videos, and live-capture entries.
+            logger.info("Loading camera array")
+            self.load_camera_array()
 
             # Load capture volume if extrinsic calibration complete
             if self.capture_volume_tab_enabled:
@@ -290,6 +289,7 @@ class WorkspaceCoordinator(QObject):
         a status snapshot. Called by the Project tab whenever it refreshes.
         """
         camera_count = self.camera_count  # Now a property
+        host_camera_count = count_attached_capture_devices_without_opening()
         expected_cam_ids = set(self.cam_ids) if self.cam_ids else set()
 
         # Intrinsic video availability
@@ -308,7 +308,9 @@ class WorkspaceCoordinator(QObject):
 
         return WorkflowStatus(
             camera_count=camera_count,
+            host_camera_count=host_camera_count,
             charuco_configured=True,
+            intrinsic_calibration_file_count=len(intrinsic_cam_ids),
             intrinsic_videos_available=len(intrinsic_missing) == 0,
             intrinsic_videos_missing=intrinsic_missing,
             intrinsic_calibration_complete=self.camera_array.all_intrinsics_calibrated(),
@@ -450,6 +452,69 @@ class WorkspaceCoordinator(QObject):
         logger.info(f"camera display data is {camera_display_data}")
         self.new_camera_data.emit(cam_id, camera_display_data)
 
+    def add_live_camera(self, device_index: int) -> int:
+        """Add a workspace camera that reads from a live capture device index.
+
+        Persists to the camera array. Rejects duplicate device indices already
+        assigned to another camera.
+
+        Raises:
+            ValueError: If the device cannot be opened or does not produce a frame.
+        """
+        for cam in self.camera_array.cameras.values():
+            if cam.live_device_index == device_index:
+                raise ValueError(
+                    f"Capture device {device_index} is already in use (cam_id {cam.cam_id})"
+                )
+
+        cap = cv2.VideoCapture(device_index)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open capture device {device_index}")
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                raise ValueError(f"No frame read from capture device {device_index}")
+            h, w = frame.shape[:2]
+        finally:
+            cap.release()
+
+        cam_id = (max(self.camera_array.cameras.keys()) + 1) if self.camera_array.cameras else 0
+        new_cam = CameraData(
+            cam_id=cam_id,
+            size=(int(w), int(h)),
+            live_device_index=device_index,
+        )
+        self.camera_array.cameras[cam_id] = new_cam
+        self.camera_repository.save(self.camera_array)
+        self.status_changed.emit()
+        logger.info("Added live camera cam_id=%s device_index=%s", cam_id, device_index)
+        return cam_id
+
+    def persist_live_camera_resolution(self, cam_id: int, size: tuple[int, int]) -> None:
+        """Update stored capture size for a live camera and drop intrinsic data.
+
+        Intrinsics and reports are removed because they apply to the previous resolution.
+        """
+        if cam_id not in self.camera_array.cameras:
+            logger.warning("persist_live_camera_resolution: unknown cam_id=%s", cam_id)
+            return
+
+        cam = self.camera_array.cameras[cam_id]
+        cam.size = (int(size[0]), int(size[1]))
+        cam.matrix = None
+        cam.distortions = None
+        cam.error = None
+        cam.grid_count = None
+
+        self._intrinsic_reports.pop(cam_id, None)
+        self._intrinsic_points.pop(cam_id, None)
+        self.intrinsic_report_repository.delete(cam_id)
+
+        self.camera_repository.save(self.camera_array)
+        self.push_camera_data(cam_id)
+        self.status_changed.emit()
+        logger.info("Persisted live resolution for cam_id=%s: %s×%s", cam_id, size[0], size[1])
+
     def create_intrinsic_presenter(self, cam_id: int) -> IntrinsicCalibrationPresenter:
         """Create presenter for intrinsic calibration of a single camera.
 
@@ -461,16 +526,17 @@ class WorkspaceCoordinator(QObject):
         (not after app restart).
 
         Raises:
-            ValueError: If cam_id is not in camera_array or intrinsic video doesn't exist.
+            ValueError: If cam_id is not in camera_array, or neither live device nor intrinsic video is available.
         """
         if cam_id not in self.camera_array.cameras:
             raise ValueError(f"No camera data for cam_id {cam_id}")
 
         camera = self.camera_array.cameras[cam_id]
-        video_path = self.workspace_guide.intrinsic_dir / f"cam_{cam_id}.mp4"
-
-        if not video_path.exists():
-            raise ValueError(f"No intrinsic video for cam_id {cam_id}")
+        video_path: Path | None = None
+        if camera.live_device_index is None:
+            video_path = self.workspace_guide.intrinsic_dir / f"cam_{cam_id}.mp4"
+            if not video_path.exists():
+                raise ValueError(f"No intrinsic video for cam_id {cam_id}")
 
         # Get cached data for overlay restoration
         report = self._intrinsic_reports.get(cam_id)

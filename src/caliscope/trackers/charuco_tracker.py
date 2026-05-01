@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class CharucoTracker(Tracker):
+    """Track ChArUco corners using OpenCV's board model from ``charuco.board``.
+
+    Object points are the pure ``columns × rows`` grid in meters; paper margins
+    and page size are excluded from corner geometry (same model as ``charuco.board``).
+    """
+
     def __init__(self, charuco):
         # need camera to know resolution and to assign calibration parameters
         # to camera

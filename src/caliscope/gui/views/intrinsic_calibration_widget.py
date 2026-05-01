@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -381,6 +382,15 @@ class FrameRenderThread(QThread):
         self._current_point_radius = max(5, width // 300)
         self._current_point_thickness = max(2, width // 500)
 
+    def set_camera(self, camera: CameraData) -> None:
+        """Update camera reference and overlay scales after resolution change."""
+        self._camera = camera
+        width = camera.size[0]
+        self._accumulated_radius = max(4, width // 400)
+        self._grid_line_thickness = max(2, width // 600)
+        self._current_point_radius = max(5, width // 300)
+        self._current_point_thickness = max(2, width // 500)
+
     def set_undistort(self, enabled: bool, calibrated_camera: CameraData | None) -> None:
         """Enable/disable undistortion."""
         self._undistort_enabled = enabled
@@ -559,6 +569,7 @@ class IntrinsicCalibrationWidget(QWidget):
         super().__init__(parent)
         self._presenter = presenter
         self._user_dragging = False
+        self._resolution_combo: QComboBox | None = None
 
         self._setup_ui()
         self._setup_render_thread()
@@ -600,6 +611,23 @@ class IntrinsicCalibrationWidget(QWidget):
         self._frame_label.setStyleSheet("background-color: #1a1a1a;")
         video_layout.addWidget(self._frame_label)
 
+        if self._presenter.is_live_stream:
+            res_row = QHBoxLayout()
+            res_row.setSpacing(8)
+            res_label = QLabel("Resolution")
+            res_label.setStyleSheet("color: #aaa; font-size: 12px;")
+            res_row.addWidget(res_label)
+            self._resolution_combo = QComboBox()
+            self._resolution_combo.setToolTip(
+                "Capture resolution from the camera driver. Changing this clears live calibration data."
+            )
+            for w, h in self._presenter.live_supported_resolutions:
+                self._resolution_combo.addItem(f"{w} \u00d7 {h}", (w, h))
+            self._sync_resolution_combo_from_size(self._presenter.camera.size[0], self._presenter.camera.size[1])
+            self._resolution_combo.currentIndexChanged.connect(self._on_resolution_combo_index_changed)
+            res_row.addWidget(self._resolution_combo, stretch=1)
+            video_layout.addLayout(res_row)
+
         # Legend for boundary overlay (hidden by default)
         self._boundary_legend = QLabel("Original frame boundary")
         self._boundary_legend.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -615,9 +643,14 @@ class IntrinsicCalibrationWidget(QWidget):
         self._position_slider.setMinimum(0)
         self._position_slider.setMaximum(max(0, self._presenter.frame_count - 1))
         self._position_slider.setStyleSheet(Styles.SLIDER)
+        if self._presenter.is_live_stream:
+            self._position_slider.setEnabled(False)
         slider_row.addWidget(self._position_slider)
 
-        self._frame_counter = QLabel(f"0 / {self._presenter.frame_count - 1}")
+        if self._presenter.is_live_stream:
+            self._frame_counter = QLabel("Live")
+        else:
+            self._frame_counter = QLabel(f"0 / {self._presenter.frame_count - 1}")
         self._frame_counter.setMinimumWidth(100)
         slider_row.addWidget(self._frame_counter)
 
@@ -698,36 +731,70 @@ class IntrinsicCalibrationWidget(QWidget):
 
     def _on_position_changed(self, frame_index: int) -> None:
         """Presenter reports position - update slider and counter."""
-        self._position_slider.blockSignals(True)
-        try:
-            self._position_slider.setValue(frame_index)
-        finally:
-            self._position_slider.blockSignals(False)
+        if not self._presenter.is_live_stream:
+            self._position_slider.blockSignals(True)
+            try:
+                self._position_slider.setValue(frame_index)
+            finally:
+                self._position_slider.blockSignals(False)
 
-        self._frame_counter.setText(f"{frame_index} / {self._presenter.frame_count - 1}")
+        max_i = max(0, self._presenter.frame_count - 1)
+        if self._presenter.is_live_stream:
+            self._frame_counter.setText(f"Live — frame {frame_index}")
+        else:
+            self._frame_counter.setText(f"{frame_index} / {max_i}")
 
     def _update_ui_for_state(self, state: IntrinsicCalibrationState) -> None:
         """Update UI elements based on presenter state."""
+        live = self._presenter.is_live_stream
+        if self._resolution_combo is not None:
+            self._resolution_combo.setEnabled(
+                live
+                and state
+                not in (IntrinsicCalibrationState.CALIBRATING, IntrinsicCalibrationState.COLLECTING)
+            )
         if state == IntrinsicCalibrationState.READY:
             self._calibrate_btn.setText("Calibrate")
             self._calibrate_btn.setEnabled(True)
             self._undistort_checkbox.setEnabled(False)
-            self._position_slider.setEnabled(True)
+            self._position_slider.setEnabled(not live)
+            if live:
+                self._calibrate_btn.setToolTip(
+                    "Collect board detections from the live feed. "
+                    "Click Stop when you have good coverage to run calibration."
+                )
+            else:
+                self._calibrate_btn.setToolTip("")
         elif state == IntrinsicCalibrationState.COLLECTING:
             self._calibrate_btn.setText("Stop")
             self._calibrate_btn.setEnabled(True)
             self._undistort_checkbox.setEnabled(False)
             self._position_slider.setEnabled(False)
+            if live:
+                self._calibrate_btn.setToolTip(
+                    "Finish collecting and calibrate if any frames were captured; "
+                    "otherwise cancel."
+                )
+            else:
+                self._calibrate_btn.setToolTip("Abort calibration collection.")
         elif state == IntrinsicCalibrationState.CALIBRATING:
             self._calibrate_btn.setText("Calibrating...")
             self._calibrate_btn.setEnabled(False)
             self._undistort_checkbox.setEnabled(False)
             self._position_slider.setEnabled(False)
+            self._calibrate_btn.setToolTip("")
         elif state == IntrinsicCalibrationState.CALIBRATED:
             self._calibrate_btn.setText("Recalibrate")
             self._calibrate_btn.setEnabled(True)
             self._undistort_checkbox.setEnabled(True)
-            self._position_slider.setEnabled(True)
+            self._position_slider.setEnabled(not live)
+            if live:
+                self._calibrate_btn.setToolTip(
+                    "Collect board detections from the live feed. "
+                    "Click Stop when you have good coverage to run calibration."
+                )
+            else:
+                self._calibrate_btn.setToolTip("")
 
     def _restore_calibrated_state(self) -> None:
         """Initialize display for restored calibration state (from session cache).
@@ -782,6 +849,45 @@ class IntrinsicCalibrationWidget(QWidget):
         """Handle calibration failure."""
         # Could show error in UI, but for now just log it
         logger.error(f"Calibration failed: {error_msg}")
+
+    def _sync_resolution_combo_from_size(self, width: int, height: int) -> None:
+        if self._resolution_combo is None:
+            return
+        text = f"{int(width)} \u00d7 {int(height)}"
+        idx = self._resolution_combo.findText(text)
+        if idx < 0:
+            return
+        self._resolution_combo.blockSignals(True)
+        try:
+            self._resolution_combo.setCurrentIndex(idx)
+        finally:
+            self._resolution_combo.blockSignals(False)
+
+    def _on_resolution_combo_index_changed(self, _index: int) -> None:
+        if self._resolution_combo is None:
+            return
+        data = self._resolution_combo.currentData(Qt.ItemDataRole.UserRole)
+        if data is None:
+            return
+        w, h = data
+        self._presenter.request_live_resolution(int(w), int(h))
+
+    def on_live_resolution_applied(self) -> None:
+        """Refresh UI after the workspace persisted a new live capture resolution."""
+        if not self._presenter.is_live_stream:
+            return
+        self._render_thread.set_camera(self._presenter.camera)
+        cw, ch = self._presenter.camera.size
+        self._sync_resolution_combo_from_size(cw, ch)
+        self._results_display.reset()
+        self._undistort_checkbox.blockSignals(True)
+        try:
+            self._undistort_checkbox.setChecked(False)
+        finally:
+            self._undistort_checkbox.blockSignals(False)
+        self._render_thread.set_undistort(False, None)
+        self._boundary_legend.hide()
+        self._render_thread.rerender_cached()
 
     def closeEvent(self, event) -> None:
         """Clean up on close."""

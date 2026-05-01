@@ -26,7 +26,7 @@ from caliscope.gui.theme import Colors
 from caliscope.gui.utils.chessboard_preview import render_chessboard_pixmap
 from caliscope.gui.utils.charuco_preview import render_charuco_pixmap
 from caliscope.gui.utils.spinbox_utils import setup_spinbox_sizing
-from caliscope.gui.camera_list_widget import CameraListWidget
+from caliscope.gui.intrinsic_cameras_sidebar import IntrinsicCamerasSidebar
 from caliscope.gui.views.intrinsic_calibration_widget import IntrinsicCalibrationWidget
 
 if TYPE_CHECKING:
@@ -70,9 +70,26 @@ class CamerasTabWidget(QWidget):
         self._connect_signals()
         self._update_pattern_preview()
 
-        # Auto-select first camera if available
-        if self.camera_list.count() > 0:
-            self.camera_list.setCurrentRow(0)
+        # Auto-open only non-live streams: live capture starts hardware in presenter __init__
+        first_row = self._first_auto_select_camera_row()
+        if first_row is not None:
+            self._camera_sidebar.active_list.setCurrentRow(first_row)
+
+    def _first_auto_select_camera_row(self) -> int | None:
+        """Prefer a file-backed camera so opening the tab never starts live capture."""
+
+        active = self._camera_sidebar.active_list
+        for row in range(active.count()):
+            item = active.item(row)
+            if item is None:
+                continue
+            cam_id_raw = item.data(Qt.ItemDataRole.UserRole)
+            if cam_id_raw is None:
+                continue
+            cam = self.coordinator.camera_array.cameras.get(int(cam_id_raw))
+            if cam is not None and cam.live_device_index is None:
+                return row
+        return None
 
     def _setup_ui(self) -> None:
         """Build the UI layout."""
@@ -88,9 +105,9 @@ class CamerasTabWidget(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        self.camera_list = CameraListWidget(self.coordinator.camera_array)
-        self.camera_list.setMinimumWidth(150)
-        left_layout.addWidget(self.camera_list, stretch=1)
+        self._camera_sidebar = IntrinsicCamerasSidebar(self.coordinator)
+        self._camera_sidebar.setMinimumWidth(150)
+        left_layout.addWidget(self._camera_sidebar, stretch=1)
 
         # Chessboard reference preview (read-only)
         self._pattern_preview = QLabel()
@@ -144,7 +161,8 @@ class CamerasTabWidget(QWidget):
 
     def _connect_signals(self) -> None:
         """Connect internal signals."""
-        self.camera_list.camera_selected.connect(self._on_camera_selected)
+        self._camera_sidebar.camera_selected.connect(self._on_camera_selected)
+        self._camera_sidebar.live_device_drop_requested.connect(self._on_live_device_drop_requested)
         self.coordinator.intrinsic_target_changed.connect(self._on_intrinsic_target_changed)
         self._frame_skip_spin.valueChanged.connect(self._on_frame_skip_changed)
 
@@ -180,6 +198,10 @@ class CamerasTabWidget(QWidget):
                 return
 
             presenter.calibration_complete.connect(partial(self._on_calibration_complete, cam_id))
+            presenter.live_resolution_changed.connect(
+                lambda w, h, cid=cam_id: self._on_live_resolution_changed(cid, w, h)
+            )
+            presenter.start_live_capture_if_needed()
             widget = IntrinsicCalibrationWidget(presenter)
 
             self._presenters[cam_id] = presenter
@@ -193,6 +215,16 @@ class CamerasTabWidget(QWidget):
         self._current_cam_id = cam_id
 
         logger.info(f"Intrinsic calibration widget active for cam {cam_id}")
+
+    def _on_live_resolution_changed(self, cam_id: int, width: int, height: int) -> None:
+        """Persist capture size after the live thread applies a new resolution."""
+        self.coordinator.persist_live_camera_resolution(cam_id, (width, height))
+        presenter = self._presenters.get(cam_id)
+        if presenter is not None:
+            presenter.bind_workspace_camera(self.coordinator.camera_array.cameras[cam_id])
+        widget = self._widgets.get(cam_id)
+        if widget is not None:
+            widget.on_live_resolution_applied()
 
     def _on_calibration_complete(self, cam_id: int, output: IntrinsicCalibrationOutput) -> None:
         """Handle calibration completion - persist and update list."""
@@ -208,7 +240,19 @@ class CamerasTabWidget(QWidget):
         self.coordinator.persist_intrinsic_calibration(output, collected_points)
 
         # Refresh camera list to show updated status
-        self.camera_list.refresh(self.coordinator.camera_array)
+        self._camera_sidebar.refresh_active_list()
+
+    def _on_live_device_drop_requested(self, device_index: int) -> None:
+        """Promote a detected capture device to an active project camera."""
+        try:
+            cam_id = self.coordinator.add_live_camera(device_index)
+        except ValueError as e:
+            logger.warning("add_live_camera: %s", e)
+            self._show_message(str(e))
+            return
+        self._camera_sidebar.remove_detected_device_row(device_index)
+        self._camera_sidebar.refresh_active_list()
+        self._camera_sidebar.active_list.select_cam_id(cam_id)
 
     def _show_message(self, text: str) -> None:
         """Show a message in the content area."""
