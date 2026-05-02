@@ -43,11 +43,16 @@ caliscope
 
 ### Development setup
 
+Use **uv** only: create the repo’s **`.venv`**, install with **`uv sync`** (and `uv pip` when you need ad-hoc packages), and point your editor at `.venv`. Do **not** use conda or other env managers for this project.
+
 ```bash
 git clone https://github.com/mprib/caliscope.git
 cd caliscope
+uv venv --python 3.12
 uv sync --group dev --extra gui
 ```
+
+Activate `.venv` in your shell (`source .venv/bin/activate` on macOS/Linux, `.\.venv\Scripts\Activate.ps1` in Windows PowerShell). See [Developing from source](https://mprib.github.io/caliscope/installation/#developing-from-source) for full steps, including installing a Python version with `uv python install` when needed.
 
 ## Features
 

@@ -40,6 +40,7 @@ class WorkflowStatus:
     intrinsic_calibration_file_count: int  # cam_*.mp4 files in calibration/intrinsic/
 
     # Step 2: Intrinsic Calibration
+    intrinsic_mp4_count: int  # cam_*.mp4 files in calibration/intrinsic (filesystem)
     intrinsic_videos_available: bool
     intrinsic_videos_missing: list[int]  # Ports with missing videos
     intrinsic_calibration_complete: bool

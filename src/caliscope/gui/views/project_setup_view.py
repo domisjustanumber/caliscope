@@ -3,7 +3,7 @@
 This is the landing tab for Caliscope that:
 1. Displays workspace path with folder access
 2. Configures intrinsic and extrinsic calibration targets
-3. Shows board previews with PNG export
+3. Shows board previews; Print chart opens a temp PDF in the system viewer for printing
 4. Displays workflow status checklist with navigation
 
 Unlike other tabs, this view wires directly to the Coordinator (no Presenter)
@@ -16,14 +16,16 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, Signal
+from PySide6.QtCore import QByteArray, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -35,10 +37,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import cv2
-
 from caliscope.core.workflow_status import StepStatus, WorkflowStatus
 from caliscope.gui.utils.aruco_preview import render_aruco_pixmap
+from caliscope.gui.utils.calibration_target_pdf import (
+    save_aruco_marker_pdf,
+    save_charuco_board_pdf,
+    save_chessboard_pdf,
+)
 from caliscope.gui.utils.chessboard_preview import render_chessboard_pixmap
 from caliscope.gui.utils.charuco_preview import render_charuco_pixmap
 from caliscope.gui.widgets.aruco_target_config_panel import ArucoTargetConfigPanel
@@ -299,7 +304,7 @@ class ProjectSetupView(QWidget):
 
         main_layout.addWidget(self._intrinsic_stack)
 
-        # Save button
+        # Print chart button
         self._intrinsic_save_btn = QPushButton()
         main_layout.addWidget(self._intrinsic_save_btn)
 
@@ -308,12 +313,12 @@ class ProjectSetupView(QWidget):
         if routing.intrinsic_target_type == "charuco":
             self._intrinsic_type_combo.setCurrentIndex(0)
             self._intrinsic_stack.setCurrentIndex(_INTRINSIC_PAGE_CHARUCO)
-            self._intrinsic_save_btn.setText("Save Board + Mirror")
+            self._intrinsic_save_btn.setText("Print chart")
             self._update_intrinsic_charuco_preview()
         else:
             self._intrinsic_type_combo.setCurrentIndex(1)
             self._intrinsic_stack.setCurrentIndex(_INTRINSIC_PAGE_CHESSBOARD)
-            self._intrinsic_save_btn.setText("Save PNG")
+            self._intrinsic_save_btn.setText("Print chart")
             self._update_intrinsic_chessboard_preview()
 
         return group
@@ -371,7 +376,7 @@ class ProjectSetupView(QWidget):
 
         main_layout.addWidget(self._extrinsic_stack)
 
-        # Save button
+        # Print chart button
         self._extrinsic_save_btn = QPushButton()
         main_layout.addWidget(self._extrinsic_save_btn)
 
@@ -388,7 +393,7 @@ class ProjectSetupView(QWidget):
             self._extrinsic_type_combo.setCurrentIndex(1)
             self._same_as_intrinsic_check.setVisible(False)
             self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_ARUCO)
-            self._extrinsic_save_btn.setText("Save PNG")
+            self._extrinsic_save_btn.setText("Print chart")
             self._update_extrinsic_aruco_preview()
 
         return group
@@ -399,8 +404,9 @@ class ProjectSetupView(QWidget):
         layout = QVBoxLayout(group)
         layout.setSpacing(4)
 
-        # Camera count display (read-only, derived from filesystem)
+        # Camera / intrinsic video summary (read-only, derived from filesystem)
         self._camera_count_label = QLabel()
+        self._camera_count_label.setWordWrap(True)
         self._camera_count_label.setStyleSheet("color: #888; font-style: italic;")
         layout.addWidget(self._camera_count_label)
 
@@ -467,6 +473,16 @@ class ProjectSetupView(QWidget):
         self._intrinsic_save_btn.clicked.connect(self._save_intrinsic_target)
         self._extrinsic_save_btn.clicked.connect(self._save_extrinsic_target)
 
+        if self._intrinsic_charuco_panel is not None:
+            self._intrinsic_charuco_panel.sync_computed_square_to_model()
+        routing = self._coordinator.targets_repository.get_routing()
+        if (
+            self._extrinsic_charuco_panel is not None
+            and routing.extrinsic_target_type == "charuco"
+            and not routing.extrinsic_charuco_same_as_intrinsic
+        ):
+            self._extrinsic_charuco_panel.sync_computed_square_to_model()
+
     # -------------------------------------------------------------------------
     # Event Handlers - Intrinsic Target
     # -------------------------------------------------------------------------
@@ -481,10 +497,7 @@ class ProjectSetupView(QWidget):
         self._coordinator.update_intrinsic_target_type(target_type)
 
         # Update save button text
-        if target_type == "charuco":
-            self._intrinsic_save_btn.setText("Save Board + Mirror")
-        else:
-            self._intrinsic_save_btn.setText("Save PNG")
+        self._intrinsic_save_btn.setText("Print chart")
 
         # If switching away from charuco while extrinsic same-as-intrinsic is checked,
         # uncheck it and switch extrinsic to editable mode
@@ -532,12 +545,12 @@ class ProjectSetupView(QWidget):
             self._update_extrinsic_charuco_preview()
 
     def _save_intrinsic_target(self) -> None:
-        """Save intrinsic target board image(s) to file."""
+        """Open intrinsic calibration chart PDF in the system print/PDF viewer."""
         target_type = self._coordinator.targets_repository.intrinsic_target_type
         if target_type == "charuco":
-            self._save_charuco_images(self._intrinsic_charuco_panel)
+            self._save_char_pdf(self._intrinsic_charuco_panel)
         else:
-            self._save_chessboard_png(self._intrinsic_chessboard_panel)
+            self._save_chessboard_pdf(self._intrinsic_chessboard_panel)
 
     # -------------------------------------------------------------------------
     # Event Handlers - Extrinsic Target
@@ -565,27 +578,27 @@ class ProjectSetupView(QWidget):
         target_type = self._extrinsic_type_combo.currentData()
         if target_type == "aruco":
             self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_ARUCO)
-            self._extrinsic_save_btn.setText("Save PNG")
+            self._extrinsic_save_btn.setText("Print chart")
             self._extrinsic_save_btn.setEnabled(True)
             self._extrinsic_save_btn.setToolTip("")
             self._update_extrinsic_aruco_preview()
         else:  # "charuco"
             same_as_intrinsic = self._same_as_intrinsic_check.isChecked()
             self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_CHARUCO)
-            self._extrinsic_save_btn.setText("Save Board + Mirror")
+            self._extrinsic_save_btn.setText("Print chart")
 
             if same_as_intrinsic:
-                # Disable save button and sync panel from intrinsic
+                # Disable print button and sync panel from intrinsic
                 self._extrinsic_save_btn.setEnabled(False)
                 self._extrinsic_save_btn.setToolTip(
-                    "Board images are the same as the intrinsic target — use the intrinsic Save button."
+                    "Chart matches the intrinsic target — use intrinsic Print chart."
                 )
                 charuco = self._coordinator.targets_repository.load_intrinsic_charuco()
                 if self._extrinsic_charuco_panel is not None:
                     self._extrinsic_charuco_panel.setEnabled(False)
                     self._extrinsic_charuco_panel.set_values(charuco)
             else:
-                # Enable save button and editable panel
+                # Enable print button and editable panel
                 self._extrinsic_save_btn.setEnabled(True)
                 self._extrinsic_save_btn.setToolTip("")
                 if self._extrinsic_charuco_panel is not None:
@@ -616,12 +629,12 @@ class ProjectSetupView(QWidget):
             self._update_extrinsic_charuco_preview()
 
     def _save_extrinsic_target(self) -> None:
-        """Save extrinsic target board image(s) to file."""
+        """Open extrinsic calibration chart PDF in the system print/PDF viewer."""
         target_type = self._coordinator.targets_repository.extrinsic_target_type
         if target_type == "aruco":
-            self._save_aruco_png(self._extrinsic_aruco_panel)
+            self._save_aruco_pdf(self._extrinsic_aruco_panel)
         else:
-            self._save_charuco_images(self._extrinsic_charuco_panel)
+            self._save_char_pdf(self._extrinsic_charuco_panel)
 
     # -------------------------------------------------------------------------
     # Preview Updates
@@ -653,64 +666,71 @@ class ProjectSetupView(QWidget):
         self._extrinsic_aruco_preview.setPixmap(pixmap)
 
     # -------------------------------------------------------------------------
-    # File Save Handlers
+    # Print chart (temp PDF + system viewer)
     # -------------------------------------------------------------------------
 
-    def _save_charuco_images(self, panel: CharucoConfigPanel | None) -> None:
-        """Save charuco board as front PNG + mirror PNG."""
+    def _open_path_with_default_application(self, path: Path) -> None:
+        """Open a file with the OS default handler (Preview, Edge, xdg-open, …)."""
+        path_str = os.path.normpath(str(path.resolve()))
+        logger.info(f"Opening for print/view: {path_str}")
+        url = QUrl.fromLocalFile(path_str)
+        if QDesktopServices.openUrl(url):
+            return
+        logger.warning("QDesktopServices.openUrl failed; falling back to shell open for %s", path_str)
+        if sys.platform == "win32":
+            os.startfile(path_str)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path_str], check=False)
+        else:
+            subprocess.run(["xdg-open", path_str], check=False)
+
+    def _write_temp_pdf_and_open(self, prefix: str, write_pdf: Callable[[Path], None]) -> None:
+        """Write a PDF via ``write_pdf(path)`` to a temp file and launch the system viewer."""
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".pdf",
+                prefix=f"caliscope_{prefix}_",
+                delete=False,
+            ) as tmp:
+                out = Path(tmp.name)
+            write_pdf(out)
+            self._open_path_with_default_application(out)
+        except Exception:
+            logger.exception("Failed to write or open calibration chart PDF")
+
+    def _save_char_pdf(self, panel: CharucoConfigPanel | None) -> None:
+        """ChArUco board: 2-page PDF (front + mirror) at 1:1 print scale, opened for printing."""
         if panel is None:
             return
         charuco = panel.get_charuco()
-        default_dir = self._coordinator.workspace
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save ChArUco Board", str(default_dir / "charuco_board.png"), "PNG Files (*.png)"
-        )
-        if file_path:
-            charuco.save_image(file_path)
-            # Save mirror alongside with _mirror suffix
-            p = Path(file_path)
-            mirror_path = p.parent / f"{p.stem}_mirror{p.suffix}"
-            charuco.save_mirror_image(str(mirror_path))
-            logger.info(f"Saved charuco board to {file_path} and mirror to {mirror_path}")
+        def write(path: Path) -> None:
+            save_charuco_board_pdf(path, charuco)
 
-    def _save_chessboard_png(self, panel: ChessboardConfigPanel | None) -> None:
-        """Save chessboard as a high-resolution PNG file."""
+        self._write_temp_pdf_and_open("charuco", write)
+
+    def _save_chessboard_pdf(self, panel: ChessboardConfigPanel | None) -> None:
+        """Chessboard 2-page A4 PDF, opened for printing."""
         if panel is None:
             return
         chessboard = panel.get_chessboard()
-        default_path = Path(self._coordinator.workspace) / "chessboard.png"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Chessboard",
-            str(default_path),
-            "PNG Files (*.png)",
-        )
-        if file_path:
-            pixmap = render_chessboard_pixmap(chessboard, 2000)
-            pixmap.save(file_path, "PNG")
-            logger.info(f"Saved chessboard to {file_path}")
 
-    def _save_aruco_png(self, panel: ArucoTargetConfigPanel | None) -> None:
-        """Save ArUco marker image to file."""
+        def write(path: Path) -> None:
+            save_chessboard_pdf(path, chessboard)
+
+        self._write_temp_pdf_and_open("chessboard", write)
+
+    def _save_aruco_pdf(self, panel: ArucoTargetConfigPanel | None) -> None:
+        """ArUco marker 2-page PDF at configured size, opened for printing."""
         if panel is None:
             return
         target = panel.get_aruco_target()
         marker_id = target.marker_ids[0] if target.marker_ids else 0
 
-        default_path = Path(self._coordinator.workspace) / f"aruco_marker_{marker_id}.png"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save ArUco Marker",
-            str(default_path),
-            "PNG Files (*.png)",
-        )
+        def write(path: Path) -> None:
+            save_aruco_marker_pdf(path, target, marker_id)
 
-        if file_path:
-            # Generate high-resolution marker for printing
-            bgr = target.generate_marker_image(marker_id, pixels_per_meter=8000)
-            cv2.imwrite(file_path, bgr)
-            logger.info(f"Saved ArUco marker to {file_path}")
+        self._write_temp_pdf_and_open(f"aruco_{marker_id}", write)
 
     # -------------------------------------------------------------------------
     # Other Handlers

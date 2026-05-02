@@ -20,7 +20,7 @@ low_conf has a peak logit of 0.1, producing confidence ~0.1, below the 0.3 thres
 This keypoint tests the confidence filtering logic.
 
 Usage:
-    pip install onnx  # one-time, not needed for running tests
+    uv pip install onnx  # one-time, not needed for running tests
     python tests/fixtures/onnx/generate_simcc_3pt.py
 """
 

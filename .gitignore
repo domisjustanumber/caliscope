@@ -10,7 +10,8 @@ llm/*
 *.log
 *.json
 *.pyc
-.vscode*
+.vscode/*
+!.vscode/settings.json
 .idea*
 *.bz2
 .venv*

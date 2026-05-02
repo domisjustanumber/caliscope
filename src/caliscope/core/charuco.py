@@ -8,6 +8,7 @@ from __future__ import annotations
 # readability of 3D positional output downstream
 
 import logging
+import math
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -19,6 +20,92 @@ import rtoml
 logger = logging.getLogger(__name__)
 
 INCHES_PER_CM = 0.393701
+
+# Symmetric PDF / print margin per side for ChArUco layout (see ``derive_charuco_square_cm_and_margin_mm``).
+MIN_CHARUCO_PRINT_MARGIN_MM = 5.0
+
+
+def board_dimensions_cm(board_width: float, board_height: float, units: str) -> tuple[float, float]:
+    """Physical board width and height in centimeters."""
+    if units == "inch":
+        return board_width / INCHES_PER_CM, board_height / INCHES_PER_CM
+    return float(board_width), float(board_height)
+
+
+def derive_charuco_square_cm_and_margin_mm(
+    board_width: float,
+    board_height: float,
+    units: str,
+    columns: int,
+    rows: int,
+) -> tuple[float, float]:
+    """ChArUco square edge (cm) and symmetric PDF margin (mm).
+
+    The square size is **one decimal place in cm** (e.g. 5.3, 5.4). It is the
+    nearest tenth to the maximum zero-margin fit, **never larger** than that fit.
+    Margin is the uniform inset so ``min(inner_w/col, inner_h/row)`` equals that
+    square size, then the square is reduced if needed so the margin is at least
+    :data:`MIN_CHARUCO_PRINT_MARGIN_MM` per side (when possible at ``s >= 0.1`` cm).
+    """
+    w_cm, h_cm = board_dimensions_cm(board_width, board_height, units)
+    if columns < 1 or rows < 1:
+        return 0.01, 0.0
+
+    q = min(w_cm / columns, h_cm / rows)
+    s = round(q, 1)
+    if s > q + 1e-12:
+        s = max(0.1, math.floor(q * 10 + 1e-12) / 10.0)
+
+    def feasible(s_val: float) -> bool:
+        if s_val < 0.05:
+            return False
+        m1 = (w_cm - s_val * columns) / 2.0
+        m2 = (h_cm - s_val * rows) / 2.0
+        if m1 < -1e-9 or m2 < -1e-9:
+            return False
+        m = min(m1, m2)
+        if m < 0:
+            return False
+        iw, ih = w_cm - 2.0 * m, h_cm - 2.0 * m
+        return min(iw / columns, ih / rows) + 1e-9 >= s_val
+
+    while s >= 0.1 and not feasible(s):
+        s = round(s - 0.1, 1)
+
+    if not feasible(s):
+        s = 0.1
+
+    min_margin_cm = MIN_CHARUCO_PRINT_MARGIN_MM / 10.0
+
+    def margin_cm(s_val: float) -> float:
+        m1 = (w_cm - s_val * columns) / 2.0
+        m2 = (h_cm - s_val * rows) / 2.0
+        return max(0.0, min(m1, m2))
+
+    while s > 0.1 + 1e-12 and margin_cm(s) + 1e-9 < min_margin_cm:
+        s = round(s - 0.1, 1)
+
+    while s >= 0.1 and not feasible(s):
+        s = round(s - 0.1, 1)
+
+    if not feasible(s):
+        s = 0.1
+
+    m_cm = margin_cm(s)
+    margin_mm = m_cm * 10.0
+    return round(s, 1), margin_mm
+
+
+def compute_square_edge_cm_for_print_layout(
+    board_width: float,
+    board_height: float,
+    units: str,
+    columns: int,
+    rows: int,
+) -> float:
+    """Square edge in cm for calibration (one decimal); see :func:`derive_charuco_square_cm_and_margin_mm`."""
+    sq, _margin = derive_charuco_square_cm_and_margin_mm(board_width, board_height, units, columns, rows)
+    return sq
 
 
 class Charuco:
@@ -42,7 +129,7 @@ class Charuco:
     ):  # after printing, measure actual and return to override
         """
         Create board based on shape and dimensions
-        square_size_override_cm: correct for the actual printed size of the board
+        square_size_override_cm: physical square edge (cm); from board layout + print margin in the GUI
         """
         self.columns = columns
         self.rows = rows
@@ -115,20 +202,35 @@ class Charuco:
         else:
             return self.board_width
 
-    def board_height_scaled(self, pixmap_scale):
-        if self.board_height_cm > self.board_width_cm:
-            scaled_height = int(pixmap_scale)
-        else:
-            scaled_height = int(pixmap_scale * (self.board_height_cm / self.board_width_cm))
-        return scaled_height
+    def square_edge_cm(self) -> float:
+        """Physical square edge in centimeters (matches ``Charuco.board`` ``squareLength`` in meters × 100)."""
+        if self.square_size_override_cm is not None:
+            return float(self.square_size_override_cm)
+        return float(
+            min(
+                self.board_height_cm / self.rows,
+                self.board_width_cm / self.columns,
+            )
+        )
 
-    def board_width_scaled(self, pixmap_scale):
-        if self.board_height_cm > self.board_width_cm:
-            scaled_width = int(pixmap_scale * (self.board_width_cm / self.board_height_cm))
-        else:
-            scaled_width = int(pixmap_scale)
+    def pattern_size_mm(self) -> tuple[float, float]:
+        """Printed ChArUco grid extent in mm (``columns ×`` / ``rows ×`` square edge); excludes paper margins."""
+        s = self.square_edge_cm()
+        return float(self.columns) * s * 10.0, float(self.rows) * s * 10.0
 
-        return scaled_width
+    def board_img_pixel_size(self, pixmap_scale: int) -> tuple[int, int]:
+        """Pixel size for :meth:`board_img`: aspect ``columns`` : ``rows`` so OpenCV does not letterbox the grid."""
+        c, r = int(self.columns), int(self.rows)
+        scale = max(1, int(pixmap_scale))
+        if c < 1 or r < 1:
+            return scale, scale
+        if c >= r:
+            w = scale
+            h = max(1, int(round(scale * r / c)))
+        else:
+            h = scale
+            w = max(1, int(round(scale * c / r)))
+        return w, h
 
     @property
     def dictionary_object(self):
@@ -138,6 +240,7 @@ class Charuco:
 
     @property
     def board(self):
+        """``cv2.aruco.CharucoBoard`` for detection/calibration: grid only (no print margins in object coordinates)."""
         if self.square_size_override_cm:
             square_length = self.square_size_override_cm / 100  # note: in cm within GUI
         else:
@@ -161,14 +264,9 @@ class Charuco:
         return board
 
     def board_img(self, pixmap_scale=1000):
-        """
-        returns a cv2 image (numpy array) of the board
-        smaller scale image by default for display to GUI
-        provide larger max_edge_length to get printer-ready png
-        """
-        img = self.board.generateImage(
-            (self.board_width_scaled(pixmap_scale=pixmap_scale), self.board_height_scaled(pixmap_scale=pixmap_scale))
-        )
+        """Grayscale raster of the ChArUco grid only (tight bounds, no paper margin or letterboxing)."""
+        w, h = self.board_img_pixel_size(int(pixmap_scale))
+        img = self.board.generateImage((w, h))
         if self.inverted:
             img = cv2.bitwise_not(img)
 

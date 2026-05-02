@@ -104,3 +104,35 @@ With the package installed and the virtual environment activated, the main GUI c
 ```bash
 caliscope
 ```
+
+## Developing from source
+
+For contributors editing this repository: use **uv** only. Create **`.venv`** in the checkout, install dependencies with **`uv sync`**, and use **`uv pip`** for extra packages — do **not** use conda, mamba, or `pip` against a system interpreter for this project.
+
+If you do not yet have a compatible Python on your PATH (3.10–3.13), install one with uv, for example:
+
+```bash
+uv python install 3.12
+```
+
+=== "Windows (PowerShell)"
+
+    ```powershell
+    git clone https://github.com/mprib/caliscope.git
+    cd caliscope
+    uv venv --python 3.12
+    uv sync --group dev --extra gui
+    .\.venv\Scripts\Activate.ps1
+    ```
+
+=== "macOS & Linux"
+
+    ```bash
+    git clone https://github.com/mprib/caliscope.git
+    cd caliscope
+    uv venv --python 3.12
+    uv sync --group dev --extra gui
+    source .venv/bin/activate
+    ```
+
+Point your editor at **`.venv`** (or use `uv run …`) so tools use the uv-managed environment. If `.venv` was created with the wrong interpreter, delete the folder and run `uv venv --python …` again before `uv sync`.
